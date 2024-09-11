@@ -1,40 +1,34 @@
-import imaplib
-import email
-from email.header import decode_header
-import re
 import os
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
 from collections import defaultdict
 from datetime import datetime
-from email.utils import parsedate_to_datetime
 import pandas as pd
 
-# Email credentials (fetched from environment variables)
-EMAIL = os.environ['GMAIL_ADDRESS']
-PASSWORD = os.environ['GMAIL_APP_PASSWORD']
-IMAP_SERVER = "imap.gmail.com"
-
-# Limit for how many emails to fetch at a time
+# Define the scope required for accessing Gmail
+SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 MAX_EMAILS_TO_FETCH = 100000
-BATCH_SIZE = 50  # Number of emails to fetch at once
+BATCH_SIZE = 50  # Not used anymore but keeping for compatibility
 
-def connect_imap():
-    print("Connecting to Gmail IMAP server...")
-    mail = imaplib.IMAP4_SSL(IMAP_SERVER)
-    try:
-        mail.login(EMAIL, PASSWORD)
-        print("Logged in successfully.")
-    except imaplib.IMAP4.error as e:
-        print(f"Login failed. Check your credentials. Error: {e}")
-        return None
-    return mail
+# OAuth 2.0 authentication function
+def authenticate_gmail():
+    creds = None
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open('token.json', 'w') as token:
+            token.write(creds.to_json())
+    return build('gmail', 'v1', credentials=creds)
 
-def fetch_emails_by_address(mail, email_addresses, max_emails):
-    try:
-        mail.select('"[Gmail]/All Mail"')
-    except imaplib.IMAP4.abort as e:
-        print(f"Error selecting All Mail folder: {e}")
-        return defaultdict()
-
+# Fetch emails using Gmail API
+def fetch_emails_by_address(service, email_addresses, max_emails):
     email_stats = defaultdict(lambda: {
         'first_email_date': None,
         'last_email_date': None,
@@ -45,77 +39,45 @@ def fetch_emails_by_address(mail, email_addresses, max_emails):
 
     for email_address in email_addresses:
         print(f"\nSearching for emails to/from: {email_address}")
+        query = f'from:{email_address} OR to:{email_address}'
 
-        # Define search criteria for TO or FROM the email address
-        criteria = '(OR TO "{}" FROM "{}")'.format(email_address, email_address)
+        results = service.users().messages().list(userId='me', q=query, maxResults=max_emails).execute()
+        messages = results.get('messages', [])
 
-        try:
-            status, messages = mail.search(None, criteria)
-        except imaplib.IMAP4.abort as e:
-            print(f"Error searching emails for address {email_address}: {e}")
-            continue
+        print(f"Found {len(messages)} emails for {email_address}. Processing now...")
 
-        if status != 'OK':
-            print(f"No emails found for {email_address}.")
-            continue
+        for msg in messages:
+            msg_data = service.users().messages().get(userId='me', id=msg['id'], format='metadata').execute()
+            headers = msg_data['payload']['headers']
 
-        email_ids = messages[0].split()
-        email_ids = email_ids[-max_emails:]  # Limit to most recent `max_emails`
+            email_date = None
+            from_email = None
+            to_email = None
 
-        print(f"Found {len(email_ids)} emails for {email_address}. Processing now in batches...")
+            for header in headers:
+                if header['name'] == 'Date':
+                    email_date = datetime.strptime(header['value'], '%a, %d %b %Y %H:%M:%S %z')
+                elif header['name'] == 'From':
+                    from_email = header['value']
+                elif header['name'] == 'To':
+                    to_email = header['value']
 
-        for i in range(0, len(email_ids), BATCH_SIZE):
-            batch = email_ids[i:i + BATCH_SIZE]
-            batch_str = ",".join(batch.decode() for batch in batch)
+            if email_date:
+                if email_stats[email_address]['first_email_date'] is None or email_date < email_stats[email_address]['first_email_date']:
+                    email_stats[email_address]['first_email_date'] = email_date
+                if email_stats[email_address]['last_email_date'] is None or email_date > email_stats[email_address]['last_email_date']:
+                    email_stats[email_address]['last_email_date'] = email_date
 
-            try:
-                # Fetch only the headers (FROM, TO, DATE)
-                status, msg_data = mail.fetch(batch_str, "(BODY[HEADER.FIELDS (FROM TO DATE)])")
-                if status != 'OK':
-                    print(f"Failed to fetch batch starting with ID {batch[0]}")
-                    continue
-            except imaplib.IMAP4.abort as e:
-                print(f"Error fetching batch starting with email ID {batch[0]}: {e}")
-                continue
+            if email_address in from_email:
+                email_stats[email_address]['total_sent'] += 1
+            if email_address in to_email:
+                email_stats[email_address]['total_received'] += 1
 
-            for response_part in msg_data:
-                if isinstance(response_part, tuple):
-                    try:
-                        msg = email.message_from_bytes(response_part[1])
-
-                        # Decode date and handle potential errors
-                        date = msg.get("Date")
-                        email_date = parsedate_to_datetime(date)
-
-                        # Update first/last email dates
-                        if email_stats[email_address]['first_email_date'] is None or email_date < email_stats[email_address]['first_email_date']:
-                            email_stats[email_address]['first_email_date'] = email_date
-                        if email_stats[email_address]['last_email_date'] is None or email_date > email_stats[email_address]['last_email_date']:
-                            email_stats[email_address]['last_email_date'] = email_date
-
-                        from_ = msg.get("From")
-                        to_ = msg.get("To")
-
-                        # Extract sender's email
-                        from_email = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', from_)
-                        to_emails = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', to_)
-
-                        # Process the FROM field (emails sent by the user)
-                        if email_address in from_email:
-                            email_stats[email_address]['total_sent'] += 1
-                            email_stats[email_address]['total_emails'] += 1
-
-                        # Process the TO field (emails received by the user)
-                        if email_address in to_emails:
-                            email_stats[email_address]['total_received'] += 1
-                            email_stats[email_address]['total_emails'] += 1
-
-                    except Exception as e:
-                        print(f"Error processing email in batch: {e}")
-                        continue
+            email_stats[email_address]['total_emails'] += 1
 
     return email_stats
 
+# Summarize email statistics
 def summarize_stats(email_stats):
     sorted_emails = sorted(email_stats.items(), key=lambda x: x[1]['total_emails'], reverse=True)
     for email_address, stats in sorted_emails:
@@ -126,6 +88,7 @@ def summarize_stats(email_stats):
         print(f"  First email: {stats['first_email_date'].strftime('%Y-%m-%d') if stats['first_email_date'] else 'N/A'}")
         print(f"  Last email: {stats['last_email_date'].strftime('%Y-%m-%d') if stats['last_email_date'] else 'N/A'}")
 
+# Save the statistics to a CSV file
 def save_stats_to_csv(email_stats, filename="email_stats.csv"):
     data = []
     for email_address, stats in email_stats.items():
@@ -138,20 +101,17 @@ def save_stats_to_csv(email_stats, filename="email_stats.csv"):
             "Last Email": stats['last_email_date'].strftime('%Y-%m-%d') if stats['last_email_date'] else None
         })
 
-    # Create a pandas DataFrame
     df = pd.DataFrame(data)
-
-    # Save to a CSV file
     df.to_csv(filename, index=False)
     print(f"CSV file saved to {filename}")
 
+# Main function
 def main():
-    email_addresses = ["example@email.com","example2@email.com"]
+    email_addresses = ["example1@gmail.com", "example2@gmail.com"]  # Modify this with real email addresses
 
-    mail = connect_imap()
-    if mail:
-        email_stats = fetch_emails_by_address(mail, email_addresses, MAX_EMAILS_TO_FETCH)
-        mail.logout()
+    service = authenticate_gmail()  # Use OAuth to authenticate with Gmail
+    if service:
+        email_stats = fetch_emails_by_address(service, email_addresses, MAX_EMAILS_TO_FETCH)
 
         # Summarize and save stats
         summarize_stats(email_stats)
@@ -159,3 +119,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
